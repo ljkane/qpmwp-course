@@ -60,7 +60,7 @@ class Constraints:
                 upper=None) -> None:
 
         def match_arg(x, lst):
-            return [el for el in lst if x in el][0]
+            return [el for el in lst if x in el][0]  # [0] is important -> eg. if user enters "Long", it won't pick both
 
         box_type = match_arg(box_type, ["LongOnly", "LongShort", "Unbounded"])
 
@@ -76,7 +76,7 @@ class Constraints:
                     lower = 0
                     upper = 1
                 else:
-                    lower = upper * 0
+                    lower = upper * 0  # multiplying by 0 ensures lower has the same shape/type as upper, whether upper is a scalar or an array
             else:
                 if not np.isscalar(lower):
                     if any(l < 0 for l in lower):
@@ -198,4 +198,4 @@ class Constraints:
         A = A.reshape(-1, A.shape[-1]) if A is not None else None
         G = G.reshape(-1, G.shape[-1]) if G is not None else None
 
-        return {'G': G, 'h': h, 'A': A, 'b': b}
+        return {'G': G, 'h': h, 'A': A, 'b': b}  # G is the linear and box constraints (inequality constraints), and A only the budget constraint (equality constraint(s))
