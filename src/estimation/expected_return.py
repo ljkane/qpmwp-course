@@ -35,9 +35,13 @@ import pandas as pd
 
 class ExpectedReturnSpecification(dict):
 
-    def __init__(self, **kwargs):
+    def __init__(self,
+                 method='geometric',
+                 scalefactor=1,
+                 **kwargs):
         super().__init__(
-            method='pearson',
+            method=method,
+            scalefactor=scalefactor,
         )
         self.update(kwargs)
 
