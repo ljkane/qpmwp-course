@@ -51,10 +51,13 @@ import pandas as pd
 
 class CovarianceSpecification(dict):
 
-    def __init__(self, **kwargs):
+    def __init__(self,
+                 method='pearson',
+                #  check_positive_definite=False,
+                 **kwargs):
         super().__init__(
-            method='pearson',
-            # check_positive_definite=False,
+            method=method,
+            # check_positive_definite=check_positive_definite,
         )
         self.update(kwargs)
 

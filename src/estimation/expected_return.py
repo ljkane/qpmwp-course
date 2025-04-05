@@ -25,7 +25,6 @@ import pandas as pd
 
 # [ ] Add mean estimator functions:
 #       [ ] mean_harmonic
-#       [ ] arithmetic mean
 #       [ ] mean_ewma (exponential weighted)
 
 
@@ -53,7 +52,7 @@ class ExpectedReturn:
                  **kwargs):
         self.spec = ExpectedReturnSpecification() if spec is None else spec
         self.spec.update(kwargs)
-        self._vector: Union[pd.Series, np.ndarray] = None
+        self._vector: Union[pd.Series, np.ndarray, None] = None
 
     @property
     def spec(self):

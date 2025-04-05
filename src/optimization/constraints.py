@@ -128,7 +128,6 @@ class Constraints:
         self.linear = {'G': G, 'sense': sense, 'rhs': rhs}
         return None
 
-    # name: turnover or leverage
     def add_l1(self,
                name: str,
                rhs=None,
