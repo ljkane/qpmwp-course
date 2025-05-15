@@ -82,6 +82,8 @@ class Backtest:
             self.strategy.portfolios.append(portfolio)
 
         return None
+    
+
 
     def save(self,
              filename: str,

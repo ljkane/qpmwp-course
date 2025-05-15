@@ -14,7 +14,7 @@
 # Third party imports
 import numpy as np
 import pandas as pd
-
+import xgboost as xgb
 
 
 
@@ -172,7 +172,52 @@ def bibfn_selection_data_random(bs: 'BacktestService', rebdate: str, **kwargs) -
 
 
 
+def bibfn_selection_ltr(bs: 'BacktestService', rebdate: str, **kwargs) -> None:
+    '''
+    This function constructs labels and features for a specific rebalancing date.
+    It acts as a filtering since stocks which could not be labeled or which
+    do not have features are excluded from the selection.
+    '''
 
+    # Define the selection by the ids available for the current rebalancing date
+    df_test = bs.data.merged_df[bs.data.merged_df['date'] == rebdate]
+    ids = list(df_test['id'].unique())
+
+    # Return a binary series indicating the selected stocks
+    return pd.Series(1, index=ids, name='binary', dtype=int)
+
+
+
+def bibfn_selection_jkp_factor_scores(bs, rebdate: str, **kwargs) -> pd.DataFrame:
+
+    '''
+    Backtest item builder function for defining the selection.
+    Filter stocks based on available scores in the jkp factor data.
+    '''
+
+    # Arguments
+    fields = kwargs.get('fields')
+
+    # Selection
+    ids = bs.selection.selected
+    if ids is None:
+        ids = bs.data.jkp_data.index.get_level_values('id').unique()
+
+    # Filter rows prior to the rebdate and within one year
+    df = bs.data.jkp_data[fields]
+    filtered_df = df.loc[
+        (df.index.get_level_values('date') < rebdate) &
+        (df.index.get_level_values('date') >= pd.to_datetime(rebdate) - pd.Timedelta(days=365))
+    ]
+
+    # Extract the last available value for each id
+    scores = filtered_df.groupby('id').last()
+
+    # Output
+    filter_values = scores.copy()
+    filter_values['binary'] = scores.notna().all(axis=1).astype(int)
+
+    return filter_values
 
 
 
@@ -261,6 +306,187 @@ def bibfn_bm_series(bs: 'BacktestService', rebdate: str, **kwargs) -> None:
     return None
 
 
+
+def bibfn_cap_weights(bs: 'BacktestService', rebdate: str, **kwargs) -> None:
+
+    # Selection
+    ids = bs.selection.selected
+
+    # Data - market capitalization
+    mcap = bs.data.market_data['mktcap']
+
+    # Get last available values for current rebdate
+    mcap = mcap[mcap.index.get_level_values('date') <= rebdate].groupby(
+        level = 'id'
+    ).last()
+
+    # Remove duplicates
+    mcap = mcap[~mcap.index.duplicated(keep=False)].loc[ids]
+
+    # Attach cap-weights to the optimization data object
+    bs.optimization_data['cap_weights'] = mcap / mcap.sum()
+
+    return None
+
+
+def bibfn_scores(bs: 'BacktestService', rebdate: str, **kwargs) -> None:
+
+    '''
+    Copies scores from the selection object to the optimization data object
+    '''
+
+    ids = bs.selection.selected
+    scores = bs.selection.filtered['scores'].loc[ids]
+    # Drop the 'binary' column
+    bs.optimization_data['scores'] = scores.drop(columns=['binary'])
+    return None
+
+
+def bibfn_scores_ltr(bs: 'BacktestService', rebdate: str, **kwargs) -> None:
+
+    '''
+    Constructs scores based on a Learning-to-Rank model.        
+    '''
+
+    # Arguments
+    params_xgb = kwargs.get('params_xgb')
+    if params_xgb is None or not isinstance(params_xgb, dict):
+        raise ValueError('params_xgb is not defined or not a dictionary.')
+    training_dates = kwargs.get('training_dates')
+
+    # Extract data
+    df_train = bs.data.merged_df[bs.data.merged_df['date'] < rebdate]
+    df_test = bs.data.merged_df[bs.data.merged_df['date'] == rebdate]
+    df_test = df_test.loc[df_test['id'].drop_duplicates(keep='first').index]
+    df_test = df_test.loc[df_test['id'].isin(bs.selection.selected)]
+
+    # Training data
+    X_train = (
+        df_train.drop(['date', 'id', 'label', 'ret'], axis=1)
+        # df_train.drop(['date', 'id', 'label'], axis=1)  # Include ret in the features as a proof of concept
+    )
+    y_train = df_train['label'].loc[X_train.index]
+    grouped_train = df_train.groupby('date').size().to_numpy()
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+    dtrain.set_group(grouped_train)
+
+    # Test data
+    y_test = pd.Series(df_test['label'].values, index=df_test['id'])
+    X_test = df_test.drop(['date', 'id', 'label', 'ret'], axis=1)
+    # X_test = df_test.drop(['date', 'id', 'label'], axis=1)  # Include ret in the features as a proof of concept
+    grouped_test = df_test.groupby('date').size().to_numpy()
+    dtest = xgb.DMatrix(X_test)
+    dtest.set_group(grouped_test)
+
+    # Train the model using the training data
+    if rebdate in training_dates:
+        model = xgb.train(params_xgb, dtrain, 100)
+        bs.model_ltr = model
+    else:
+        # Use the previous model for the current rebalancing date
+        model = bs.model_ltr
+
+    # Predict using the test data
+    pred = model.predict(dtest)
+    preds =  pd.Series(pred, df_test['id'], dtype='float64')
+    ranks = preds.rank(method='first', ascending=True).astype(int)
+
+    # Output
+    scores = pd.concat({
+        'scores': preds,
+        'ranks': (100 * ranks / len(ranks)).astype(int),  # Normalize the ranks to be between 0 and 100
+        'true': y_test,
+        'ret': pd.Series(df_test['ret'].values, index=df_test['id']),
+    }, axis=1)
+    bs.optimization_data['scores'] = scores
+    return None
+
+################ Linear Regression #############################
+
+import statsmodels.api as sm
+
+
+def bibfn_expected_returns(bs, rebdate: str, **kwargs) -> None:
+    """
+    Predict expected returns using linear regression on factor data from jkp_data.
+    The model fits factor exposures to next period returns and predicts expected returns at rebalance date.
+
+    :param bs: BacktestService instance
+    :param rebdate: Rebalancing date (string or pd.Timestamp)
+    :param kwargs: optional arguments:
+        - 'factors': list of factor names to use (default: ['qmj', 'niq_su'])
+        - 'lookahead_days': int, days ahead to calculate return as target (default: 63 ~ 3 months)
+    """
+
+    factors = kwargs.get('factors', ['qmj', 'niq_su'])
+    lookahead_days = kwargs.get('lookahead_days', 63)  # approx 3 months
+
+    # Prepare factor data up to rebdate (exclude rebdate itself)
+    jkp = bs.data.jkp_data
+    jkp_before = jkp.loc[jkp.index.get_level_values('date') < rebdate, factors]
+
+    # Get corresponding dates and ids
+    dates = jkp_before.index.get_level_values('date')
+    ids = jkp_before.index.get_level_values('id')
+
+    # Flatten to a DataFrame with columns for date, id, and factors
+    df_factors = jkp_before.reset_index()
+
+    # Prepare target returns: next period returns after rebdate
+    returns = bs.data.get_return_series(width=lookahead_days + 1, end_date=None)
+    # Shift returns by lookahead_days to get future returns as targets
+    future_returns = returns.shift(-lookahead_days)
+
+    # Map target returns to factor dates and ids (align by date + id)
+    # We want return from date + lookahead_days for each stock id
+
+    # Merge factor data with future returns at matching date + lookahead_days
+    df_factors['target_date'] = df_factors['date'] + pd.Timedelta(days=lookahead_days)
+    df_factors.set_index(['target_date', 'id'], inplace=True)
+    target_returns = future_returns.stack().rename('target_return')
+    df_merged = df_factors.join(target_returns, how='inner')
+
+    # Clean: drop rows with missing target or factor data
+    df_merged = df_merged.dropna(subset=factors + ['target_return'])
+
+    if df_merged.empty:
+        # No data to train on, fallback to zeros
+        expected_returns = pd.Series(0, index=bs.selection.selected)
+    else:
+        # Prepare X and y
+        X = df_merged[factors]
+        y = df_merged['target_return']
+
+        # Add constant for intercept
+        X = sm.add_constant(X)
+
+        # Fit OLS regression
+        model = sm.OLS(y, X).fit()
+
+        # Predict expected returns for latest factor values on rebdate
+        latest_factors = jkp.loc[jkp.index.get_level_values('date') <= rebdate, factors]
+        latest_factors = latest_factors.groupby('id').last()
+        X_pred = sm.add_constant(latest_factors.reindex(bs.selection.selected).fillna(0))
+
+        expected_returns = model.predict(X_pred)
+
+        # Normalize expected returns to [-1, 1]
+        max_abs = expected_returns.abs().max()
+        if max_abs > 0:
+            expected_returns = expected_returns / max_abs
+        else:
+            expected_returns = expected_returns * 0
+
+    # Store expected returns in optimization data
+    bs.optimization_data['expected_returns'] = expected_returns
+
+    return None
+
+
+
+
+
+
 # --------------------------------------------------------------------------
 # Backtest item builder functions - Optimization constraints
 # --------------------------------------------------------------------------
@@ -295,6 +521,7 @@ def bibfn_box_constraints(bs: 'BacktestService', rebdate: str, **kwargs) -> None
                                         lower = lower,
                                         upper = upper)
     return None
+
 
 def bibfn_size_dependent_upper_bounds(bs: 'BacktestService', rebdate: str, **kwargs) -> None:
 
@@ -344,3 +571,174 @@ def bibfn_size_dependent_upper_bounds(bs: 'BacktestService', rebdate: str, **kwa
         )
 
     return None
+
+
+def bibfn_turnover_constraint(bs, rebdate: str, **kwargs) -> None:
+    """
+    Function to assign a turnover constraint to the optimization.
+    """
+    if rebdate > bs.settings['rebdates'][0]:
+
+        # Arguments
+        turnover_limit = kwargs.get('turnover_limit')
+
+        # Constraints
+        bs.optimization.constraints.add_l1(
+            name = 'turnover',
+            rhs = turnover_limit,
+            x0 = bs.optimization.params['x_init'],
+        )
+
+    return None
+
+def bibfn_sector_exposure_constraint(bs, rebdate: str, **kwargs) -> None:
+    """
+    Adds sector exposure constraints to the optimization.
+    
+    :param bs: BacktestService instance
+    :param rebdate: Rebalance date
+    :param kwargs:  
+        - max_sector_weight: dict[str, float] mapping sector names to max allowed portfolio weight
+                            (default: 0.2 for all sectors)
+    """
+    max_sector_weight = kwargs.get('max_sector_weight', {})
+    default_max = 0.2
+
+    # Get selected stock IDs
+    ids = bs.selection.selected
+
+    # Get latest sector data per stock
+    sectors = bs.data.market_data['sector']
+    sectors_up_to_date = sectors.loc[sectors.index.get_level_values('date') <= rebdate]
+    latest_sectors = sectors_up_to_date.groupby('id').last().reindex(ids)
+
+    # Create sector binary exposure matrix: rows = stocks, columns = sectors
+    sector_dummies = pd.get_dummies(latest_sectors).fillna(0)
+
+    # For each sector, get max allowed weight (default if not specified)
+    sector_limits = {
+        sector: max_sector_weight.get(sector, default_max) for sector in sector_dummies.columns
+    }
+
+    # Add constraint for each sector
+    for sector, max_weight in sector_limits.items():
+        exposure_vector = sector_dummies[sector].values
+        # Add linear constraint: sum(weights * exposure_vector) <= max_weight
+        bs.optimization.constraints.add_linear_inequality(
+            name = f"sector_{sector}_max",
+            coeffs = exposure_vector,
+            rhs = max_weight,
+            sense = '<='
+        )
+    return None
+
+def bibfn_factor_exposure_constraint(bs, rebdate: str, **kwargs) -> None:
+    """
+    Adds factor exposure constraints to the optimization.
+    """
+    factors = kwargs.get('factors', [])
+    max_factor_exposure = kwargs.get('max_factor_exposure', {})
+    default_max = 0.2
+
+    ids = bs.selection.selected
+    jkp = bs.data.jkp_data
+
+    jkp_up_to_date = jkp.loc[jkp.index.get_level_values('date') <= rebdate]
+    latest_factors = jkp_up_to_date.groupby('id').last().reindex(ids)
+
+    for factor in factors:
+        if factor not in latest_factors.columns:
+            continue
+
+        exposure_vector = latest_factors[factor].reindex(ids).fillna(0).astype(float)
+
+        max_exp = max_factor_exposure.get(factor, default_max)
+
+        # Add both positive and negative constraints
+        bs.optimization.constraints.add_linear_inequality(
+            name=f"factor_{factor}_max_pos",
+            coeffs=exposure_vector,
+            rhs=max_exp,
+            sense="<="
+        )
+        bs.optimization.constraints.add_linear_inequality(
+            name=f"factor_{factor}_max_neg",
+            coeffs=-exposure_vector,
+            rhs=max_exp,
+            sense="<="
+        )
+
+
+
+
+def bibfn_selection_min_mktcap(bs, rebdate: str, **kwargs) -> pd.DataFrame:
+    
+    # Arguments
+    threshold = kwargs.get('threshold',1e8)
+    mcap = bs.data.market_data['mktcap']
+    mcap_up_to_date = mcap.loc[mcap.index.get_level_values('date')<= rebdate]
+
+    latest_mcap = mcap_up_to_date.groupby('id').last()
+
+    binary_mask = (latest_mcap >= threshold).astype(int)
+
+    return pd.DataFrame({'binary': binary_mask})
+
+
+def bibfn_selection_volatility(bs, rebdate: str, **kwargs) -> pd.DataFrame:
+    
+    # Arguments
+    window = kwargs.get('window',63)
+    max_vol = kwargs.get('max_vol', 0.05)
+
+    returns = bs.data.get_return_series(end_date=rebdate, width=window)
+    vol = returns.std()
+
+    binary_mask = (vol <= max_vol).astype(int)
+    return pd.DataFrame({'binary': binary_mask})
+
+# def bibfn_selection_quality(bs, rebdate: str, **kwargs) -> pd.DataFrame:
+#     min_qmj = kwargs.get('min_qmj', 0.5)
+#     min_niq_su = kwargs.get('min_niq_su', 0)
+
+#     jkp = bs.data.jkp_data
+
+#     # Safety check
+#     if 'qmj' not in jkp.columns or 'niq_su' not in jkp.columns:
+#         raise ValueError("Missing qmj or niq_su in jkp_data")
+
+#     # Filter jkp up to rebalance date
+#     qmj = jkp['qmj'].loc[jkp.index.get_level_values('date') <= rebdate]
+#     niq_su = jkp['niq_su'].loc[jkp.index.get_level_values('date') <= rebdate]
+
+#     print(f"[DEBUG] Number of qmj values before groupby: {qmj.shape}")
+#     print(f"[DEBUG] Number of niq_su values before groupby: {niq_su.shape}")
+
+#     # Group and get last values per stock
+#     latest_qmj = qmj.groupby('id').last()
+#     latest_niq_su = niq_su.groupby('id').last()
+
+#     print(f"[DEBUG] latest_qmj has {latest_qmj.isna().sum()} NaNs")
+#     print(f"[DEBUG] latest_niq_su has {latest_niq_su.isna().sum()} NaNs")
+
+#     # Combine into DataFrame
+#     df = pd.DataFrame({
+#         'qmj': latest_qmj,
+#         'niq_su': latest_niq_su
+#     })
+
+#     # Print example values
+#     print(df.head(10))
+
+#     # Drop missing values
+#     df = df.dropna()
+
+#     # Apply filter
+#     mask = (df['qmj'] >= min_qmj) & (df['niq_su'] >= min_niq_su)
+
+#     print(f"[DEBUG] Final mask sample:\n{mask.head(10)}")
+#     print(f"[DEBUG] Final number of selected stocks: {mask.sum()}")
+
+#     return pd.DataFrame({'binary': mask.astype(int)})
+
+

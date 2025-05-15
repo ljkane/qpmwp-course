@@ -97,6 +97,28 @@ class Constraints:
 
         self.box = boxcon
         return None
+    
+def add_linear_inequality(self,
+                          name: str,
+                          coeffs: pd.Series | np.ndarray,
+                          rhs: float,
+                          sense: str = '<=') -> None:
+    """
+    Convenience method to add a single linear inequality constraint.
+    """
+    if isinstance(coeffs, np.ndarray):
+        coeffs = pd.Series(coeffs, index=self.ids)
+
+    # Clean and align
+    coeffs = coeffs.reindex(self.ids).fillna(0).astype(float)
+
+    self.add_linear(
+        g_values=coeffs,
+        sense=sense,
+        rhs=rhs,
+        name=name
+    )
+
 
     def add_linear(self,
                    G: pd.DataFrame = None,
@@ -199,3 +221,5 @@ class Constraints:
         G = G.reshape(-1, G.shape[-1]) if G is not None else None
 
         return {'G': G, 'h': h, 'A': A, 'b': b}
+    
+    
